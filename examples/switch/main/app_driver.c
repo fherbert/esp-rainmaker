@@ -21,9 +21,18 @@
 #define BUTTON_GPIO          0
 #define BUTTON_ACTIVE_LEVEL  0
 
+/**
+ * zero crossing input on GPIO19
+ * for frequency and delay calc we need to trigger on rising and falling edges.
+ * once we've initialised, then we can change the trigger to rising edge only.
+ */
+#define zerocrossgpio 19
+static uint32_t frequency = 100; /* default to 50Hz */
+static uint32_t zcdelay = 0; /* how long in ms to wait after zc before voltage is at zero */
+
 /* This is the GPIO on which the power will be set */
-#define OUTPUT_GPIO    19
-static bool g_power_state = DEFAULT_POWER;
+#define OUTPUT_GPIO    20
+static bool g_power_state = !DEFAULT_POWER; // The default power state should be off
 
 /* These values correspoind to H,S,V = 120,100,10 */
 #define DEFAULT_RED     0
@@ -44,9 +53,14 @@ static void app_indicator_set(bool state)
 
 static void app_indicator_init(void)
 {
+    /* Steps:
+    1. Enable 
+    u_int32_t start_time;
+    */
     ws2812_led_init();
     app_indicator_set(g_power_state);
 }
+
 static void push_btn_cb(void *arg)
 {
     bool new_state = !g_power_state;
@@ -78,8 +92,17 @@ void app_driver_init()
         .pull_up_en = 1,
     };
     io_conf.pin_bit_mask = ((uint64_t)1 << OUTPUT_GPIO);
-    /* Configure the GPIO */
+    /* Configure the output GPIO */
     gpio_config(&io_conf);
+    /* Configure zero crossing */
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = ((uint64_t)1 << zerocrossgpio);
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+    // set the initial interrupt for zc deteector to trigger on rising and falling edge
+    //gpio_set_intr_type(GPIO_INPUT_IO_0, GPIO_INTR_ANYEDGE);
     app_indicator_init();
 }
 

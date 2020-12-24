@@ -12,10 +12,13 @@
 #include <iot_button.h>
 #include <esp_rmaker_core.h>
 #include <esp_rmaker_standard_params.h> 
+#include <esp_log.h>
 
 #include <app_reset.h>
 #include <ws2812_led.h>
 #include "app_priv.h"
+
+static const char *TAG = "app_driver";
 
 /* This is the button that is used for toggling the power */
 #define BUTTON_GPIO          0
@@ -27,8 +30,20 @@
  * once we've initialised, then we can change the trigger to rising edge only.
  */
 #define zerocrossgpio 19
-static uint32_t frequency = 100; /* default to 50Hz */
+static uint32_t frequency = 0; /* default to 50Hz */
 static uint32_t zcdelay = 0; /* how long in ms to wait after zc before voltage is at zero */
+static xQueueHandle zc_evt_queue = NULL;
+static uint64_t zcstarttime1 = 0; // timestamp for the start of 1st the zc pulse
+static uint64_t zcstarttime2 = 0; // timestamp for the start of 2nd the zc pulse
+static uint64_t zcendtime1 = 0; // timestamp for the end of the 1st zc pulse
+static uint64_t zcendtime2 = 0; // timestamp for the end of the 2nd zc pulse
+static uint64_t zctimeout = 1000000; // 1 second timeout waiting for zero crossing
+
+static void IRAM_ATTR zc_isr_handler(void* arg)
+{
+    uint32_t gpio_num = (uint32_t) arg;
+    xQueueSendFromISR(zc_evt_queue, &gpio_num, NULL);
+}
 
 /* This is the GPIO on which the power will be set */
 #define OUTPUT_GPIO    20
@@ -76,8 +91,35 @@ static void set_power_state(bool target)
     app_indicator_set(target);
 }
 
+static void zc_init_task(void* arg)
+{
+    uint32_t io_num;
+    for(;;) {
+        if(xQueueReceive(zc_evt_queue, &io_num, portMAX_DELAY)) {
+            
+            // check pin level, 
+            if (gpio_get_level(io_num) == 1)
+            printf("GPIO[%d] intr, val: %d\n", io_num, gpio_get_level(io_num));
+        }
+    }
+}
+
+static void zc_task(void* arg)
+{
+    uint32_t io_num;
+    for(;;) {
+        if(xQueueReceive(zc_evt_queue, &io_num, portMAX_DELAY)) {
+            // check pin level, 
+            printf("GPIO[%d] intr, val: %d\n", io_num, gpio_get_level(io_num));
+        }
+    }
+}
+
 void app_driver_init()
 {
+    uint64_t timeout = 0; // timestamp for timeout of freq detection
+    bool error = false; // zc detect error 
+    uint64_t period = 0; // ac period
     button_handle_t btn_handle = iot_button_create(BUTTON_GPIO, BUTTON_ACTIVE_LEVEL);
     if (btn_handle) {
         /* Register a callback for a button tap (short press) event */
@@ -101,8 +143,82 @@ void app_driver_init()
     io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     gpio_config(&io_conf);
+    /*
     // set the initial interrupt for zc deteector to trigger on rising and falling edge
-    //gpio_set_intr_type(GPIO_INPUT_IO_0, GPIO_INTR_ANYEDGE);
+    gpio_set_intr_type(zerocrossgpio, GPIO_INTR_ANYEDGE);
+    //create a queue to handle gpio event from isr
+    zc_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    //start zc init task
+    xTaskCreate(zc_init_task, "zc_init_task", 2048, NULL, 10, NULL);
+    //install gpio isr service
+    // Not required as io_button already does this??
+    //gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    //hook isr handler for specific zc gpio pin
+    gpio_isr_handler_add(zerocrossgpio, zc_isr_handler, (void*) zerocrossgpio);
+    */
+    ESP_LOGI(TAG, "Init - Waiting for frequency detection");
+    // Wait until frequency is set or timeout occurs
+    zcstarttime1 = esp_timer_get_time();
+    timeout = zcstarttime1 + zctimeout;
+    // Wait until we see a 0 on the zc input pin
+    while((zcstarttime1 = esp_timer_get_time()) < timeout && gpio_get_level(zerocrossgpio) == 1 ) {}
+    if (zcstarttime1 >= timeout) {
+        ESP_LOGI(TAG, "!!! Timeout waiting for low on zc input pin");
+        error = true;
+    }
+    // DETECT FIRST ZC PULSE
+    // Now wait for a 1 on the zc input pin
+    zcstarttime1 = esp_timer_get_time();
+    timeout = zcstarttime1 + zctimeout;
+    while((zcstarttime1 = esp_timer_get_time()) < timeout && gpio_get_level(zerocrossgpio) == 0 ) {}
+    if (zcstarttime1 >= timeout) {
+        ESP_LOGI(TAG, "!!! Timeout waiting for high on zc input pin start of first pulse");
+        error = true;
+    }
+    // Now wait for a 0 on the zc input pin
+    zcendtime1 = esp_timer_get_time();
+    timeout = zcendtime1 + zctimeout;
+    while((zcendtime1 = esp_timer_get_time()) < timeout && gpio_get_level(zerocrossgpio) == 1 ) {}
+    if (zcendtime1 >= timeout) {
+        ESP_LOGI(TAG, "!!! Timeout waiting for low on zc input pin end of first pulse");
+        error = true;
+    }
+    // END OF DETECT FIRST ZC PULSE
+    // DETECT START OF SECOND ZC PULSE
+    // wait for a 1 on the zc input pin
+    zcstarttime2 = esp_timer_get_time();
+    timeout = zcstarttime2 + zctimeout;
+    while((zcstarttime2 = esp_timer_get_time()) < timeout && gpio_get_level(zerocrossgpio) == 0 ) {}
+    if (zcstarttime2 >= timeout) {
+        ESP_LOGI(TAG, "!!! Timeout waiting for high on zc input pin start of second pulse");
+        error = true;
+    }
+    // Now wait for a 0 on the zc input pin
+    zcendtime2 = esp_timer_get_time();
+    timeout = zcendtime2 + zctimeout;
+    while((zcendtime2 = esp_timer_get_time()) < timeout && gpio_get_level(zerocrossgpio) == 1 ) {}
+    if (zcendtime2 >= timeout) {
+        ESP_LOGI(TAG, "!!! Timeout waiting for low on zc input pin end of second pulse");
+        error = true;
+    }
+    // END OF DETECT SECOND ZC PULSE
+    if (!error) {
+        zcdelay = ((zcendtime1 - zcstarttime1) / 2) + ((zcendtime2 - zcstarttime2) /2 ) / 2; // average duration of half the zc pulse over 2 pulses
+        // Calculate hte period by subtracting the 2nd pulse starttime from the first pulse startime
+        // then multiple it by 2 since the AC signal is rectified
+        period = (zcstarttime2 - zcstarttime1) * 2;
+        if (period > 17000) {
+            frequency = 50 *2;
+        } else {
+            frequency = 60 *2;
+        }
+        ESP_LOGI(TAG, "Period detected: %llu us", period);
+        ESP_LOGI(TAG, "Frequency detected: %u Hz", frequency);
+    }
+    //xTaskCreate(zc_task, "zc_task", 2048, NULL, 10, NULL);
+    //hook isr handler for specific zc gpio pin
+    //gpio_isr_handler_add(zerocrossgpio, zc_isr_handler, (void*) zerocrossgpio);
+    
     app_indicator_init();
 }
 

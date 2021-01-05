@@ -13,6 +13,7 @@
 #include <esp_rmaker_core.h>
 #include <esp_rmaker_standard_params.h> 
 #include <esp_log.h>
+#include "driver/timer.h"
 
 #include <app_reset.h>
 #include <ws2812_led.h>
@@ -32,21 +33,78 @@ static const char *TAG = "app_driver";
 #define zerocrossgpio 19
 static uint32_t frequency = 0; /* default to 50Hz */
 static uint32_t zcdelay = 0; /* how long in ms to wait after zc before voltage is at zero */
-static xQueueHandle zc_evt_queue = NULL;
-static uint64_t zcstarttime1 = 0; // timestamp for the start of 1st the zc pulse
-static uint64_t zcstarttime2 = 0; // timestamp for the start of 2nd the zc pulse
-static uint64_t zcendtime1 = 0; // timestamp for the end of the 1st zc pulse
-static uint64_t zcendtime2 = 0; // timestamp for the end of the 2nd zc pulse
-static uint64_t zctimeout = 1000000; // 1 second timeout waiting for zero crossing
+static uint64_t on_percent = 0; //percentage of period time to turn on
+#define ESP_INTR_FLAG_DEFAULT 0
+/* This is the GPIO on which the power will be set */
+#define OUTPUT_GPIO    20
+// IGBT output
+#define OUTPUT_IGBT    41
+#define ZCDELAY_TIMER 0
+#define DIM_TIMER 1
+
+bool state = 0;
 
 static void IRAM_ATTR zc_isr_handler(void* arg)
 {
-    uint32_t gpio_num = (uint32_t) arg;
-    xQueueSendFromISR(zc_evt_queue, &gpio_num, NULL);
+    // set delay time
+    //timer_group_set_alarm_value_in_isr(TIMER_GROUP_0, ZCDELAY_TIMER, zcdelay);
+    timer_set_alarm_value(TIMER_GROUP_0, ZCDELAY_TIMER, zcdelay);
+    // reset timer
+    timer_set_counter_value(TIMER_GROUP_0, ZCDELAY_TIMER, 0);
+    // enable alarm
+    timer_set_alarm(TIMER_GROUP_0, ZCDELAY_TIMER, TIMER_ALARM_EN);
+    timer_start(TIMER_GROUP_0, ZCDELAY_TIMER); // start the zc delay timer
+    //ESP_ERROR_CHECK(esp_timer_start_once(zcdelay_timer, zcdelay));
+    /*if (state) {
+        //gpio_set_level(OUTPUT_IGBT, 0);
+        GPIO.out1_w1tc.val = ((uint32_t)1 << (OUTPUT_IGBT - 32));
+        state = 0;
+    } else {
+        //gpio_set_level(OUTPUT_IGBT, 1);
+        GPIO.out1_w1ts.val = ((uint32_t)1 << (OUTPUT_IGBT - 32));
+        state = 1;
+    }*/
 }
 
-/* This is the GPIO on which the power will be set */
-#define OUTPUT_GPIO    20
+static void IRAM_ATTR timer_group0_isr(void* arg)
+{
+    // enter critical protect
+    timer_spinlock_take(TIMER_GROUP_0);
+    // which timer is this for?
+    // int timer_idx = (int) arg;
+    // Retrieve the interrupt status from the timer that reported the interrupt 
+    uint32_t timer_intr = timer_group_get_intr_status_in_isr(TIMER_GROUP_0);
+
+    /* Clear the interrupt and update the alarm time for the timer with without reload */
+    if (timer_intr & TIMER_INTR_T0) {
+        // stop the zcdelay timer
+        timer_pause(TIMER_GROUP_0, ZCDELAY_TIMER);
+        // clear zcdelay timer interrupt status
+        timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, ZCDELAY_TIMER);
+        // turn on igbt
+        GPIO.out1_w1ts.val = ((uint32_t)1 << (OUTPUT_IGBT-32));
+        // on_us is calculated by multiplying the period by 1000000 (to get microseconds) by the percentage on time - this result in seconds
+        // the multiply by 1000 to get microseconds
+        //on_us = (1/frequency) * 1000000 * (on_percent/100)
+        //We can factorise this down to:
+        uint64_t on_us = (on_percent*10000)/frequency;
+        timer_group_set_alarm_value_in_isr(TIMER_GROUP_0, DIM_TIMER, on_us);
+        // reset the dim timer counter
+        timer_group_set_counter_enable_in_isr(TIMER_GROUP_0, DIM_TIMER, 0);
+        // start the dim timer
+        timer_start(TIMER_GROUP_0, DIM_TIMER);
+        timer_group_enable_alarm_in_isr(TIMER_GROUP_0, DIM_TIMER);
+    } else if (timer_intr & TIMER_INTR_T1) {
+        // stop the dim timer
+        timer_pause(TIMER_GROUP_0, DIM_TIMER);
+        // clear the interrupt
+        timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, DIM_TIMER);
+        // turn off igbt
+        GPIO.out1_w1tc.val = ((uint32_t)1 << (OUTPUT_IGBT - 32));
+    }
+    timer_spinlock_give(TIMER_GROUP_0);
+}
+
 static bool g_power_state = !DEFAULT_POWER; // The default power state should be off
 
 /* These values correspoind to H,S,V = 120,100,10 */
@@ -91,35 +149,36 @@ static void set_power_state(bool target)
     app_indicator_set(target);
 }
 
-static void zc_init_task(void* arg)
-{
-    uint32_t io_num;
-    for(;;) {
-        if(xQueueReceive(zc_evt_queue, &io_num, portMAX_DELAY)) {
-            
-            // check pin level, 
-            if (gpio_get_level(io_num) == 1)
-            printf("GPIO[%d] intr, val: %d\n", io_num, gpio_get_level(io_num));
-        }
-    }
-}
+void detect_freq(void);
 
-static void zc_task(void* arg)
+/*
+* Initialise the selected timer of group 0
+*
+* timer_idx - the timer number to initialise
+* timer_period_us - the interval in microseconds of alarm to set
+*/
+void init_timer(int timer_idx, int timer_period_us)
 {
-    uint32_t io_num;
-    for(;;) {
-        if(xQueueReceive(zc_evt_queue, &io_num, portMAX_DELAY)) {
-            // check pin level, 
-            printf("GPIO[%d] intr, val: %d\n", io_num, gpio_get_level(io_num));
-        }
-    }
+    timer_config_t config = {
+            .alarm_en = true,
+            .counter_en = false,
+            .intr_type = TIMER_INTR_LEVEL,
+            .counter_dir = TIMER_COUNT_UP,
+            .auto_reload = true,
+            .divider = 80   /* 1 us per tick */
+    };
+    
+    timer_init(TIMER_GROUP_0, timer_idx, &config);
+    timer_set_counter_value(TIMER_GROUP_0, timer_idx, 0);
+    timer_set_alarm_value(TIMER_GROUP_0, timer_idx, timer_period_us);
+    timer_set_alarm(TIMER_GROUP_0, timer_idx, TIMER_ALARM_EN);
+    timer_enable_intr(TIMER_GROUP_0, timer_idx);
+    timer_isr_register(TIMER_GROUP_0, timer_idx, &timer_group0_isr, (void *) timer_idx, ESP_INTR_FLAG_IRAM, NULL);
+
 }
 
 void app_driver_init()
 {
-    uint64_t timeout = 0; // timestamp for timeout of freq detection
-    bool error = false; // zc detect error 
-    uint64_t period = 0; // ac period
     button_handle_t btn_handle = iot_button_create(BUTTON_GPIO, BUTTON_ACTIVE_LEVEL);
     if (btn_handle) {
         /* Register a callback for a button tap (short press) event */
@@ -127,36 +186,58 @@ void app_driver_init()
         /* Register Wi-Fi reset and factory reset functionality on same button */
         app_reset_button_register(btn_handle, WIFI_RESET_BUTTON_TIMEOUT, FACTORY_RESET_BUTTON_TIMEOUT);
     }
+    
+    on_percent = 50; // hard code on time to 50%
 
     /* Configure power */
     gpio_config_t io_conf = {
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = 1,
+		.intr_type = GPIO_INTR_DISABLE,
     };
     io_conf.pin_bit_mask = ((uint64_t)1 << OUTPUT_GPIO);
     /* Configure the output GPIO */
     gpio_config(&io_conf);
+    /* configure IGBT output */
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    io_conf.pin_bit_mask = ((uint64_t)1 << OUTPUT_IGBT);
+    gpio_config(&io_conf);
     /* Configure zero crossing */
-    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    //io_conf.intr_type = GPIO_INTR_ANYEDGE;
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = ((uint64_t)1 << zerocrossgpio);
     io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     gpio_config(&io_conf);
-    /*
-    // set the initial interrupt for zc deteector to trigger on rising and falling edge
-    gpio_set_intr_type(zerocrossgpio, GPIO_INTR_ANYEDGE);
-    //create a queue to handle gpio event from isr
-    zc_evt_queue = xQueueCreate(10, sizeof(uint32_t));
-    //start zc init task
-    xTaskCreate(zc_init_task, "zc_init_task", 2048, NULL, 10, NULL);
-    //install gpio isr service
-    // Not required as io_button already does this??
-    //gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-    //hook isr handler for specific zc gpio pin
+
+    detect_freq();
+	
+    // initialise timers
+    init_timer(ZCDELAY_TIMER, zcdelay);
+    init_timer(DIM_TIMER, on_percent); // this time gets set everytime the zcdelay timer expires.
+
+    // trigger int on zc rising edge
+    gpio_set_intr_type(zerocrossgpio, GPIO_INTR_POSEDGE);
     gpio_isr_handler_add(zerocrossgpio, zc_isr_handler, (void*) zerocrossgpio);
-    */
-    ESP_LOGI(TAG, "Init - Waiting for frequency detection");
+	
+    app_indicator_init();
+}
+
+void detect_freq(void)
+{
+    uint64_t timeout = 0; // timestamp for timeout of freq detection
+    bool error = false; // zc detect error 
+    uint64_t period = 0; // ac period
+    //uint64_t zcdelay = 0; //how long after postive trigger is zero crossing point
+	uint64_t zcstarttime1 = 0; // timestamp for the start of 1st the zc pulse
+	uint64_t zcstarttime2 = 0; // timestamp for the start of 2nd the zc pulse
+    uint64_t zcendtime1 = 0; // timestamp for the end of the 1st zc pulse
+	uint64_t zcendtime2 = 0; // timestamp for the end of the 2nd zc pulse
+	uint64_t zctimeout = 1000000; // 1 second timeout waiting for zero crossing
+    
+	ESP_LOGI(TAG, "Init - Waiting for frequency detection");
     // Wait until frequency is set or timeout occurs
     zcstarttime1 = esp_timer_get_time();
     timeout = zcstarttime1 + zctimeout;
@@ -212,14 +293,11 @@ void app_driver_init()
         } else {
             frequency = 60 *2;
         }
+        zcdelay = (zcendtime1 - zcstarttime1) / 2; 
         ESP_LOGI(TAG, "Period detected: %llu us", period);
         ESP_LOGI(TAG, "Frequency detected: %u Hz", frequency);
+        ESP_LOGI(TAG, "Zero Crossing delay: %u us", zcdelay);
     }
-    //xTaskCreate(zc_task, "zc_task", 2048, NULL, 10, NULL);
-    //hook isr handler for specific zc gpio pin
-    //gpio_isr_handler_add(zerocrossgpio, zc_isr_handler, (void*) zerocrossgpio);
-    
-    app_indicator_init();
 }
 
 int IRAM_ATTR app_driver_set_state(bool state)

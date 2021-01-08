@@ -33,7 +33,9 @@ static const char *TAG = "app_driver";
 #define zerocrossgpio 19
 static uint32_t frequency = 0; /* default to 50Hz */
 static uint32_t zcdelay = 0; /* how long in ms to wait after zc before voltage is at zero */
-static uint64_t on_percent = 0; //percentage of period time to turn on
+static volatile uint16_t on_percent = DEFAULT_BRIGHTNESS; //percentage of period time to turn on
+static volatile uint64_t on_us = 0;
+
 #define ESP_INTR_FLAG_DEFAULT 0
 /* This is the GPIO on which the power will be set */
 #define OUTPUT_GPIO    20
@@ -43,6 +45,7 @@ static uint64_t on_percent = 0; //percentage of period time to turn on
 #define DIM_TIMER 1
 
 bool state = 0;
+bool dim_up = true; // when pressing button are we increasing or decreasing dim
 
 static void IRAM_ATTR zc_isr_handler(void* arg)
 {
@@ -83,11 +86,6 @@ static void IRAM_ATTR timer_group0_isr(void* arg)
         timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, ZCDELAY_TIMER);
         // turn on igbt
         GPIO.out1_w1ts.val = ((uint32_t)1 << (OUTPUT_IGBT-32));
-        // on_us is calculated by multiplying the period by 1000000 (to get microseconds) by the percentage on time - this result in seconds
-        // the multiply by 1000 to get microseconds
-        //on_us = (1/frequency) * 1000000 * (on_percent/100)
-        //We can factorise this down to:
-        uint64_t on_us = (on_percent*10000)/frequency;
         timer_group_set_alarm_value_in_isr(TIMER_GROUP_0, DIM_TIMER, on_us);
         // reset the dim timer counter
         timer_group_set_counter_enable_in_isr(TIMER_GROUP_0, DIM_TIMER, 0);
@@ -126,10 +124,6 @@ static void app_indicator_set(bool state)
 
 static void app_indicator_init(void)
 {
-    /* Steps:
-    1. Enable 
-    u_int32_t start_time;
-    */
     ws2812_led_init();
     app_indicator_set(g_power_state);
 }
@@ -139,18 +133,100 @@ static void push_btn_cb(void *arg)
     bool new_state = !g_power_state;
     app_driver_set_state(new_state);
     esp_rmaker_param_update_and_report(
-            esp_rmaker_device_get_param_by_name(switch_device, ESP_RMAKER_DEF_POWER_NAME),
+            esp_rmaker_device_get_param_by_name(light_device, ESP_RMAKER_DEF_POWER_NAME),
             esp_rmaker_bool(new_state));
+}
+
+esp_err_t enable_zc_interrupt(void){
+    return gpio_intr_enable(zerocrossgpio);
+}
+
+esp_err_t stop_zc_detect(void) {
+    timer_pause(TIMER_GROUP_0, DIM_TIMER);
+    timer_pause(TIMER_GROUP_0, ZCDELAY_TIMER);
+    return gpio_intr_disable(zerocrossgpio);
+}
+
+esp_err_t app_light_set_light(uint16_t brightness, bool send_update)
+{
+    bool temp_state;
+    if ((brightness < 1) || (brightness > 99)) {
+        if (brightness == 0) {
+            //if (g_power_state) {
+            //    send_update = true;
+            //}
+            temp_state = false;
+            ESP_LOGI(TAG, "Brightness = 0");
+        } else {
+            if (!g_power_state) {
+            //    send_update = true;
+                g_power_state = true;
+            }
+            temp_state = true;
+            ESP_LOGI(TAG, "Brightness = 100");
+        }
+        stop_zc_detect();
+        //set_power_state(g_power_state);
+        gpio_set_level(OUTPUT_GPIO, temp_state);
+        gpio_set_level(OUTPUT_IGBT, temp_state);
+        app_indicator_set(temp_state);
+    } else {
+        if (!g_power_state) {
+            send_update = true;
+            g_power_state = true;
+        }
+        on_us = (brightness*10000)/frequency;
+        enable_zc_interrupt();
+    }
+    if (send_update) {
+        ESP_LOGI(TAG, "Sending update");
+        esp_rmaker_param_update_and_report(
+                esp_rmaker_device_get_param_by_name(light_device, ESP_RMAKER_DEF_BRIGHTNESS_NAME),
+                esp_rmaker_int(brightness));
+    }
+
+    //return ws2812_led_set_hsv(hue, saturation, brightness);
+    //ESP_LOGI(TAG, "app_light_set_light: On microseconds set to %llu us", on_us);
+    return ESP_OK;
 }
 
 static void set_power_state(bool target)
 {
-    gpio_set_level(OUTPUT_GPIO, target);
-    app_indicator_set(target);
+    // This only gets called if the current state != required state
+    if (target) {
+        ESP_LOGI(TAG, "Set power state to on, using previous brightness %u", on_percent);
+        app_light_set_light(on_percent, true);
+    } else {
+        ESP_LOGI(TAG, "Set power state to off");
+        g_power_state = target;
+        //app_light_set_brightness(0);
+        stop_zc_detect();
+        //set_power_state(g_power_state);
+        gpio_set_level(OUTPUT_GPIO, g_power_state);
+        gpio_set_level(OUTPUT_IGBT, g_power_state);
+        app_indicator_set(g_power_state);
+    }
+    //app_indicator_set(target);
 }
 
 void detect_freq(void);
 
+void button_press_serial_cb(void *arg)
+{
+    if (dim_up) {
+        if (++on_percent >= 100) {
+            dim_up = false;
+            on_percent = 100;
+        }
+    } else {
+        if (--on_percent <= 0) {
+            dim_up = true;
+            on_percent = 0;
+        }
+    }
+    ESP_LOGI(TAG, "Button held, dim percent: %u", on_percent);
+    app_light_set_light(on_percent, true);
+}    
 /*
 * Initialise the selected timer of group 0
 *
@@ -183,11 +259,14 @@ void app_driver_init()
     if (btn_handle) {
         /* Register a callback for a button tap (short press) event */
         iot_button_set_evt_cb(btn_handle, BUTTON_CB_TAP, push_btn_cb, NULL);
+        // register a callback to increase the dim when button held down for more than a second
+        // run callback every 0.5 seconds while button is held down
+        //iot_button_set_serial_cb(btn_handle, 1, 500/portTICK_RATE_MS, button_press_serial_cb, NULL);
         /* Register Wi-Fi reset and factory reset functionality on same button */
         app_reset_button_register(btn_handle, WIFI_RESET_BUTTON_TIMEOUT, FACTORY_RESET_BUTTON_TIMEOUT);
     }
     
-    on_percent = 50; // hard code on time to 50%
+    //on_percent = DEFAULT_BRIGHTNESS; // hard code on time to 50%
 
     /* Configure power */
     gpio_config_t io_conf = {
@@ -213,15 +292,20 @@ void app_driver_init()
     gpio_config(&io_conf);
 
     detect_freq();
-	
+    // on_us is calculated by multiplying the period by 1000000 (to get microseconds) by the percentage on time - this result in seconds
+    // the multiply by 1000 to get microseconds
+    //on_us = (1/frequency) * 1000000 * (on_percent/100)
+    //We can factorise this down to:
+    on_us = (on_percent*10000)/frequency;
     // initialise timers
     init_timer(ZCDELAY_TIMER, zcdelay);
-    init_timer(DIM_TIMER, on_percent); // this time gets set everytime the zcdelay timer expires.
+    init_timer(DIM_TIMER, on_us); // this time gets set everytime the zcdelay timer expires.
 
     // trigger int on zc rising edge
     gpio_set_intr_type(zerocrossgpio, GPIO_INTR_POSEDGE);
     gpio_isr_handler_add(zerocrossgpio, zc_isr_handler, (void*) zerocrossgpio);
-	
+	// disable the interrupt until it's needed
+    gpio_intr_disable(zerocrossgpio);
     app_indicator_init();
 }
 
@@ -302,9 +386,10 @@ void detect_freq(void)
 
 int IRAM_ATTR app_driver_set_state(bool state)
 {
+    ESP_LOGI(TAG, "Setting power state to %s, Previous state is %s", state ? "ON":"OFF", g_power_state ? "ON":"OFF");
     if(g_power_state != state) {
-        g_power_state = state;
-        set_power_state(g_power_state);
+        //g_power_state = state;
+        set_power_state(state);
     }
     return ESP_OK;
 }
@@ -312,4 +397,11 @@ int IRAM_ATTR app_driver_set_state(bool state)
 bool app_driver_get_state(void)
 {
     return g_power_state;
+}
+
+esp_err_t app_light_set_brightness(uint16_t brightness)
+{
+    on_percent = brightness;
+    //ESP_LOGI(TAG, "app_light_set_brightness: On percent set to %u us", on_percent);
+    return app_light_set_light(on_percent, false);
 }

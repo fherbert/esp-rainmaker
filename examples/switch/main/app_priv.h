@@ -10,7 +10,10 @@
 #include <stdbool.h>
 
 #define DEFAULT_POWER  true
-extern esp_rmaker_device_t *switch_device;
+#define DEFAULT_BRIGHTNESS 100
+extern esp_rmaker_device_t *light_device;
 void app_driver_init(void);
 int app_driver_set_state(bool state);
+esp_err_t app_light_set_brightness(uint16_t brightness);
 bool app_driver_get_state(void);
+esp_err_t enable_zc_interrupt(void);
